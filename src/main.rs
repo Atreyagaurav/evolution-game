@@ -4,6 +4,8 @@ use bevy::{
     sprite::MaterialMesh2dBundle,
 };
 
+use rand;
+
 const TIME_STEP: f32 = 1.0 / 60.0;
 const TOP_BOUNDARY: f32 = 250.0;
 const BOTTOM_BOUNDARY: f32 = -250.0;
@@ -15,6 +17,11 @@ const BACKGROUND_COLOR: Color = Color::rgb(0.1, 0.1, 0.1);
 const BOUNDARY_COLOR: Color = Color::rgb(0.8, 0.8, 0.8);
 const FOOD_COLOR: Color = Color::rgb(0.1, 0.4, 0.1);
 const ORGANISM_COLOR: Color = Color::rgb(0.1, 0.1, 0.4);
+
+const ORGANISM_SIZE: Vec3 = Vec3::new(20.0, 20.0, 0.0);
+const FOOD_SIZE: Vec3 = Vec3::new(10.0, 10.0, 0.0);
+
+const ORGANISM_VELOCITY: Vec2 = Vec2::new(100.0, 100.0);
 
 fn main() {
     App::new()
@@ -32,10 +39,10 @@ struct Organism;
 struct Food;
 
 #[derive(Component)]
-struct Name(String);
+struct Energy(f32);
 
 #[derive(Component)]
-struct Size(u8);
+struct Name(String);
 
 #[derive(Component, Deref, DerefMut)]
 struct Velocity(Vec2);
@@ -46,6 +53,15 @@ struct Collider;
 #[derive(Default)]
 struct CollisionEvent;
 
+fn random_xy() -> Vec3 {
+    let (x, y): (f32, f32) = (rand::random(), rand::random());
+    Vec3::new(
+        (x - 0.5) * 2.0 * TOP_BOUNDARY,
+        (y - 0.5) * 2.0 * RIGHT_BOUNDARY,
+        0.0,
+    )
+}
+
 fn apply_velocity(mut query: Query<(&mut Transform, &Velocity)>) {
     for (mut transform, velocity) in &mut query {
         transform.translation.x += velocity.x * TIME_STEP;
@@ -53,7 +69,7 @@ fn apply_velocity(mut query: Query<(&mut Transform, &Velocity)>) {
     }
 }
 
-fn add_people(
+fn startup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -70,28 +86,37 @@ fn add_people(
         MaterialMesh2dBundle {
             mesh: meshes.add(shape::Circle::default().into()).into(),
             material: materials.add(ColorMaterial::from(ORGANISM_COLOR)),
-            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 0.0))
-                .with_scale(Vec3::new(10.0, 10.0, 0.0)),
+            transform: Transform::from_translation(random_xy()).with_scale(ORGANISM_SIZE),
             ..default()
         },
         Organism,
-        Size(5),
-        Velocity(Vec2::new(5.0, 4.0)),
+        Energy(1.0),
+        Velocity(ORGANISM_VELOCITY),
     ));
 }
 
 #[derive(Resource)]
-struct GreetTimer(Timer);
+struct FoodTimer(Timer);
 
-fn greet_people(
+fn generate_food(
     time: Res<Time>,
-    mut timer: ResMut<GreetTimer>,
-    query: Query<&Name, With<Organism>>,
+    mut timer: ResMut<FoodTimer>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     if timer.0.tick(time.delta()).just_finished() {
-        for name in &query {
-            println!("hello {}!", name.0);
-        }
+        commands.spawn((
+            MaterialMesh2dBundle {
+                mesh: meshes.add(shape::Circle::default().into()).into(),
+                material: materials.add(ColorMaterial::from(FOOD_COLOR)),
+                transform: Transform::from_translation(random_xy()).with_scale(FOOD_SIZE),
+                ..default()
+            },
+            Food,
+            Energy(0.1),
+            Collider,
+        ));
     }
 }
 
@@ -167,12 +192,103 @@ impl BoundaryBundle {
     }
 }
 
+fn grow_organism(
+    mut commands: Commands,
+    mut organism_query: Query<(&mut Transform, &mut Energy), With<Organism>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    for (mut organism_transform, mut organism_energy) in &mut organism_query {
+        if organism_energy.0 > 2.0 {
+            organism_energy.0 = 1.0;
+            // Multiple organism fails, may need to modify other queries
+            // commands.spawn((
+            //     MaterialMesh2dBundle {
+            //         mesh: meshes.add(shape::Circle::default().into()).into(),
+            //         material: materials.add(ColorMaterial::from(ORGANISM_COLOR)),
+            //         transform: Transform::from_translation(random_xy()).with_scale(ORGANISM_SIZE),
+            //         ..default()
+            //     },
+            //     Organism,
+            //     Energy(1.0),
+            //     Velocity(ORGANISM_VELOCITY),
+            // ));
+        }
+        organism_transform.scale = ORGANISM_SIZE * organism_energy.0;
+    }
+}
+
+fn check_for_collisions(
+    mut commands: Commands,
+    mut organism_query: Query<(&mut Velocity, &Transform, &mut Energy), With<Organism>>,
+    collider_query: Query<(Entity, &Transform, Option<&Food>), With<Collider>>,
+    mut collision_events: EventWriter<CollisionEvent>,
+) {
+    let (mut organism_velocity, organism_transform, mut organism_energy) =
+        organism_query.single_mut();
+    let organism_size = organism_transform.scale.truncate();
+
+    // check collision with walls
+    for (collider_entity, transform, maybe_food) in &collider_query {
+        let collision = collide(
+            organism_transform.translation,
+            organism_size,
+            transform.translation,
+            transform.scale.truncate(),
+        );
+        if let Some(collision) = collision {
+            // Sends a collision event so that other systems can react to the collision
+            collision_events.send_default();
+
+            // Foods should be despawned and increment the scoreboard on collision
+            if maybe_food.is_some() {
+                organism_energy.0 += 0.2;
+                commands.entity(collider_entity).despawn();
+            } else {
+                // reflect the organism when it collides
+                let mut reflect_x = false;
+                let mut reflect_y = false;
+
+                // only reflect if the organism's velocity is going in the opposite direction of the
+                // collision
+                match collision {
+                    Collision::Left => reflect_x = organism_velocity.x > 0.0,
+                    Collision::Right => reflect_x = organism_velocity.x < 0.0,
+                    Collision::Top => reflect_y = organism_velocity.y < 0.0,
+                    Collision::Bottom => reflect_y = organism_velocity.y > 0.0,
+                    Collision::Inside => { /* do nothing */ }
+                }
+
+                // reflect velocity on the x-axis if we hit something on the x-axis
+                if reflect_x {
+                    organism_velocity.x = -organism_velocity.x;
+                }
+
+                // reflect velocity on the y-axis if we hit something on the y-axis
+                if reflect_y {
+                    organism_velocity.y = -organism_velocity.y;
+                }
+            }
+        }
+    }
+}
+
 pub struct HelloPlugin;
 
 impl Plugin for HelloPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(GreetTimer(Timer::from_seconds(2.0, TimerMode::Repeating)))
-            .add_startup_system(add_people)
-            .add_system(apply_velocity);
+        app.insert_resource(FoodTimer(Timer::from_seconds(0.2, TimerMode::Repeating)))
+            .add_startup_system(startup)
+            .add_event::<CollisionEvent>()
+            .add_system(generate_food)
+            .add_systems(
+                (
+                    check_for_collisions,
+                    apply_velocity.before(check_for_collisions),
+                    grow_organism.after(check_for_collisions),
+                )
+                    .in_schedule(CoreSchedule::FixedUpdate),
+            )
+            .insert_resource(FixedTime::new_from_secs(TIME_STEP));
     }
 }
