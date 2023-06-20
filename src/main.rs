@@ -7,10 +7,10 @@ use bevy::{
 use rand;
 
 const TIME_STEP: f32 = 1.0 / 60.0;
-const TOP_BOUNDARY: f32 = 500.0;
-const BOTTOM_BOUNDARY: f32 = -500.0;
-const RIGHT_BOUNDARY: f32 = 900.0;
-const LEFT_BOUNDARY: f32 = -900.0;
+const TOP_BOUNDARY: f32 = 400.0;
+const BOTTOM_BOUNDARY: f32 = -400.0;
+const RIGHT_BOUNDARY: f32 = 700.0;
+const LEFT_BOUNDARY: f32 = -700.0;
 const BOUNDARY_THICKNESS: f32 = 4.0;
 
 const BACKGROUND_COLOR: Color = Color::rgb(0.1, 0.1, 0.1);
@@ -63,6 +63,12 @@ enum CollisionEvent {
 }
 
 #[derive(Resource)]
+struct FoodTimer(Timer);
+
+#[derive(Resource)]
+struct SensoryTimer(Timer);
+
+#[derive(Resource)]
 struct CollisionSound(Handle<AudioSource>);
 
 #[derive(Resource)]
@@ -80,6 +86,20 @@ fn random_xy() -> Vec3 {
 fn random_velocity() -> Vec2 {
     let (x, y): (f32, f32) = (rand::random(), rand::random());
     Vec2::new(x - 0.5, y - 0.5) * 2.0 * ORGANISM_VELOCITY
+}
+
+fn adjust_velocity(
+    time: Res<Time>,
+    mut timer: ResMut<SensoryTimer>,
+    mut organism_query: Query<(&mut Velocity, &Energy), With<Organism>>,
+    _food_query: Query<&Transform, With<Food>>,
+) {
+    if timer.0.tick(time.delta()).just_finished() {
+        for (mut velocity, _energy) in &mut organism_query {
+            velocity.x = 0.99 * velocity.x + 0.02 * velocity.y;
+            velocity.y = -0.02 * velocity.x + 0.99 * velocity.y;
+        }
+    }
 }
 
 fn apply_velocity(mut query: Query<(&mut Transform, &Velocity, &Energy)>) {
@@ -124,9 +144,6 @@ fn startup(
         ));
     }
 }
-
-#[derive(Resource)]
-struct FoodTimer(Timer);
 
 fn generate_food(
     time: Res<Time>,
@@ -366,6 +383,7 @@ pub struct HelloPlugin;
 impl Plugin for HelloPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(FoodTimer(Timer::from_seconds(0.2, TimerMode::Repeating)))
+            .insert_resource(SensoryTimer(Timer::from_seconds(0.4, TimerMode::Repeating)))
             .add_startup_system(startup)
             .add_event::<CollisionEvent>()
             .add_systems(
@@ -375,6 +393,7 @@ impl Plugin for HelloPlugin {
                     apply_velocity.before(check_for_collisions),
                     grow_organism.after(check_for_collisions),
                     play_collision_sound.after(check_for_collisions),
+                    adjust_velocity,
                 )
                     .in_schedule(CoreSchedule::FixedUpdate),
             )
