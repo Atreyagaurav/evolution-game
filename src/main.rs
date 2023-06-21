@@ -24,7 +24,12 @@ const ORGANISM_SIZE: Vec3 = Vec3::new(30.0, 30.0, 0.0);
 const FOOD_SIZE: Vec3 = Vec3::new(20.0, 20.0, 0.0);
 
 const ORGANISM_VELOCITY: f32 = 100.0;
+const ORGANISM_VISION: f32 = 200.0;
 const INITIAL_POPULATION: usize = 10;
+const PREGNANT_PROBABILITY: f32 = 0.4;
+
+const ORGANISM_LIFETIME: usize = 10;
+const FOOD_LIFETIME: usize = 25;
 
 fn main() {
     App::new()
@@ -43,6 +48,12 @@ struct Food;
 
 #[derive(Component)]
 struct Energy(f32);
+
+#[derive(Component)]
+struct Age(usize);
+
+#[derive(Component)]
+struct Lifetime(usize);
 
 #[derive(Component)]
 struct Name(String);
@@ -69,6 +80,9 @@ struct FoodTimer(Timer);
 struct SensoryTimer(Timer);
 
 #[derive(Resource)]
+struct AgeTimer(Timer);
+
+#[derive(Resource)]
 struct CollisionSound(Handle<AudioSource>);
 
 #[derive(Resource)]
@@ -88,16 +102,47 @@ fn random_velocity() -> Vec2 {
     Vec2::new(x - 0.5, y - 0.5) * 2.0 * ORGANISM_VELOCITY
 }
 
+fn rotate_velocity(velocity: &mut Vec2, angle: f32) {
+    let x = angle.cos();
+    let y = angle.sin();
+    velocity.x = x * velocity.x + y * velocity.y;
+    velocity.y = -y * velocity.x + x * velocity.y;
+}
+
+fn align_velocity(velocity: &mut Vec2, delta: &Vec2) {
+    // let angle = velocity.angle_between(*delta);
+    // if angle.abs() < 0.2 {
+    let r = delta.length();
+    velocity.x = (delta.x / r) * ORGANISM_VELOCITY;
+    velocity.y = (delta.y / r) * ORGANISM_VELOCITY;
+    // } else {
+    //     rotate_velocity(velocity, angle.clamp(-0.2, 0.2))
+    // }
+}
+
 fn adjust_velocity(
     time: Res<Time>,
     mut timer: ResMut<SensoryTimer>,
-    mut organism_query: Query<(&mut Velocity, &Energy), With<Organism>>,
-    _food_query: Query<&Transform, With<Food>>,
+    mut organism_query: Query<(&mut Velocity, &Transform, &Energy), With<Organism>>,
+    food_query: Query<&Transform, With<Food>>,
 ) {
     if timer.0.tick(time.delta()).just_finished() {
-        for (mut velocity, _energy) in &mut organism_query {
-            velocity.x = 0.99 * velocity.x + 0.02 * velocity.y;
-            velocity.y = -0.02 * velocity.x + 0.99 * velocity.y;
+        for (mut velocity, transform, _energy) in &mut organism_query {
+            let organism_pos = transform.translation;
+            let mut nearest_food: Option<Vec2> = None;
+            let mut nearest_food_dist: f32 = f32::INFINITY;
+            for food_transform in &food_query {
+                let food_pos = food_transform.translation;
+                let dir = (food_pos - organism_pos).truncate();
+                let dist = dir.length();
+                if dist < ORGANISM_VISION && dist < nearest_food_dist {
+                    nearest_food_dist = dist;
+                    nearest_food = Some(dir);
+                }
+            }
+            if let Some(dir) = nearest_food {
+                align_velocity(&mut velocity, &dir);
+            }
         }
     }
 }
@@ -106,6 +151,23 @@ fn apply_velocity(mut query: Query<(&mut Transform, &Velocity, &Energy)>) {
     for (mut transform, velocity, energy) in &mut query {
         transform.translation.x += velocity.x * TIME_STEP / energy.0;
         transform.translation.y += velocity.y * TIME_STEP / energy.0;
+    }
+}
+
+fn age_progression(
+    time: Res<Time>,
+    mut timer: ResMut<AgeTimer>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Age, &Lifetime)>,
+) {
+    if timer.0.tick(time.delta()).just_finished() {
+        for (entity, mut age, lifetime) in &mut query {
+            if age.0 > lifetime.0 {
+                commands.entity(entity).despawn();
+            } else {
+                age.0 += 1;
+            }
+        }
     }
 }
 
@@ -139,6 +201,8 @@ fn startup(
             },
             Organism,
             Energy(1.0),
+            Age(1),
+            Lifetime(ORGANISM_LIFETIME),
             Pregnant(false),
             Velocity(random_velocity()),
         ));
@@ -167,6 +231,8 @@ fn generate_food(
                     ..default()
                 },
                 Food,
+                Age(1),
+                Lifetime(FOOD_LIFETIME),
                 Energy(0.1),
                 Collider,
             ));
@@ -281,6 +347,8 @@ fn grow_organism(
                 },
                 Organism,
                 Energy(0.5),
+                Age(1),
+                Lifetime(ORGANISM_LIFETIME),
                 Pregnant(false),
                 Velocity(random_velocity()),
             ));
@@ -316,12 +384,12 @@ fn check_for_collisions(
             );
             if let Some(collision) = collision {
                 if maybe_food.is_some() {
+                    commands.entity(collider_entity).despawn();
                     collision_events.send(CollisionEvent::Food);
                     organism_energy.0 += 0.2;
-                    commands.entity(collider_entity).despawn();
                     if organism_energy.0 > 1.7
                         && organism_energy.0 < 2.5
-                        && rand::random::<f32>() < 0.2
+                        && rand::random::<f32>() < PREGNANT_PROBABILITY
                     {
                         organism_pregnant.0 = true;
                     }
@@ -384,15 +452,17 @@ impl Plugin for HelloPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(FoodTimer(Timer::from_seconds(0.2, TimerMode::Repeating)))
             .insert_resource(SensoryTimer(Timer::from_seconds(0.4, TimerMode::Repeating)))
+            .insert_resource(AgeTimer(Timer::from_seconds(1.0, TimerMode::Repeating)))
             .add_startup_system(startup)
             .add_event::<CollisionEvent>()
             .add_systems(
                 (
                     generate_food,
+                    age_progression,
                     check_for_collisions,
                     apply_velocity.before(check_for_collisions),
                     grow_organism.after(check_for_collisions),
-                    play_collision_sound.after(check_for_collisions),
+                    // play_collision_sound.after(check_for_collisions),
                     adjust_velocity,
                 )
                     .in_schedule(CoreSchedule::FixedUpdate),
