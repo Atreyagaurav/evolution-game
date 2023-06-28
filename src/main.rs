@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use bevy::{
     prelude::*,
     sprite::collide_aabb::{collide, Collision},
@@ -7,29 +9,36 @@ use bevy::{
 use rand;
 
 const TIME_STEP: f32 = 1.0 / 60.0;
-const TOP_BOUNDARY: f32 = 400.0;
-const BOTTOM_BOUNDARY: f32 = -400.0;
-const RIGHT_BOUNDARY: f32 = 700.0;
-const LEFT_BOUNDARY: f32 = -700.0;
+const SIMULATION_SPEED: f32 = 5.0;
+const TOP_BOUNDARY: f32 = 300.0;
+const BOTTOM_BOUNDARY: f32 = -300.0;
+const RIGHT_BOUNDARY: f32 = 600.0;
+const LEFT_BOUNDARY: f32 = -600.0;
 const BOUNDARY_THICKNESS: f32 = 4.0;
 
 const BACKGROUND_COLOR: Color = Color::rgb(0.1, 0.1, 0.1);
 const BOUNDARY_COLOR: Color = Color::rgb(0.8, 0.8, 0.8);
 const FOOD_COLOR: Color = Color::rgb(0.1, 0.4, 0.1);
-const ORGANISM_COLOR: Color = Color::rgb(0.1, 0.1, 0.4);
-const FERTILE_ORGANISM_COLOR: Color = Color::rgb(0.3, 0.1, 0.3);
-const OLD_ORGANISM_COLOR: Color = Color::rgb(0.4, 0.1, 0.2);
 
-const ORGANISM_SIZE: Vec3 = Vec3::new(30.0, 30.0, 0.0);
-const FOOD_SIZE: Vec3 = Vec3::new(20.0, 20.0, 0.0);
+const ORGANISM_SIZE: Vec3 = Vec3::new(15.0, 15.0, 0.0);
+const PHEROMONE_SIZE: Vec3 = Vec3::new(4.0, 4.0, 0.0);
+const FOOD_SIZE: Vec3 = Vec3::new(4.0, 4.0, 0.0);
 
-const ORGANISM_VELOCITY: f32 = 100.0;
-const ORGANISM_VISION: f32 = 200.0;
-const INITIAL_POPULATION: usize = 10;
-const PREGNANT_PROBABILITY: f32 = 0.4;
+const ORGANISM_DEFAULT_SPEED: f32 = 8.0;
+const ORGANISM_VISION: f32 = 100.0;
+const INITIAL_POPULATION: usize = 50;
+const FOOD_PER_TIMESTEP: usize = 2;
+const PREGNANT_PROBABILITY: f32 = 0.5;
+const CHILDREN_PER_PREGNANCY: usize = 10;
 
-const ORGANISM_LIFETIME: usize = 10;
-const FOOD_LIFETIME: usize = 25;
+const PREGNANCY_ENERGY_MINIMUM: f32 = 2.0;
+const ORGANISM_MIN_ENERGY: f32 = 0.2;
+const ORGANISM_MAX_ENERGY: f32 = 4.0;
+const ORGANISM_DEFAULT_LIFETIME: usize = 100;
+const PHEROMONE_DEFAULT_LIFETIME: usize = ORGANISM_DEFAULT_LIFETIME / 10;
+const FERTILE_AGE: usize = ORGANISM_DEFAULT_LIFETIME / 4;
+const FOOD_LIFETIME: usize = 100;
+const MUTATION_RATE: f32 = 0.2;
 
 fn main() {
     App::new()
@@ -47,7 +56,85 @@ struct Organism;
 struct Food;
 
 #[derive(Component)]
+struct Pheromone;
+
+#[derive(Component)]
 struct Energy(f32);
+
+#[derive(Component, Debug)]
+struct GeneInfo([f32; 27]);
+
+impl Default for GeneInfo {
+    fn default() -> Self {
+        let mut gene: [f32; 27] = rand::random();
+        gene = gene.map(|g| (g - 0.5) * 2.0);
+        gene[0] /= 2.0;
+        gene[1] /= 2.0;
+        gene[2] /= 2.0;
+        Self(gene)
+    }
+}
+
+impl GeneInfo {
+    fn planned() -> Self {
+        let mut gene: [f32; 27] = [0.0; 27];
+        // slow down if food is on left or right
+        gene[16] = -0.1;
+        gene[18] = -0.1;
+        // speed up if there is food on the front
+        gene[17] = 1.0;
+        // go left if food is on left
+        gene[8] = 0.5;
+        // go right if food is on right
+        gene[9] = -0.5;
+        Self(gene)
+    }
+
+    fn mutate(&self) -> Self {
+        let new_gene = self.0.map(|g| {
+            if rand::random::<f32>() < MUTATION_RATE {
+                (g + rand::random::<f32>() / 2.0 - 0.25).clamp(-1.0, 1.0)
+            } else {
+                g
+            }
+        });
+        Self(new_gene)
+    }
+
+    fn process(&self, inputs: &[f32; 8]) -> [f32; 3] {
+        let gene = Vec::from(self.0);
+        let delta_x: f32 = (gene[0]
+            + gene[3..=10]
+                .iter()
+                .zip(inputs)
+                .map(|(c, i)| c * i)
+                .sum::<f32>())
+        .clamp(-1.0, 1.0);
+        let delta_y: f32 = (gene[1]
+            + gene[11..=18]
+                .iter()
+                .zip(inputs)
+                .map(|(c, i)| c * i)
+                .sum::<f32>())
+        .clamp(-1.0, 1.0);
+        let delta_a: f32 = (gene[2]
+            + gene[19..=26]
+                .iter()
+                .zip(inputs)
+                .map(|(c, i)| c * i)
+                .sum::<f32>())
+        .clamp(-1.0, 1.0);
+        [delta_x, delta_y, delta_a]
+    }
+
+    fn color(&self) -> Color {
+        Color::rgb(
+            (self.0[0] + 1.0) / 2.0,
+            (self.0[1] + 1.0) / 2.0,
+            (self.0[2] + 1.0) / 2.0,
+        )
+    }
+}
 
 #[derive(Component)]
 struct Age(usize);
@@ -62,7 +149,10 @@ struct Name(String);
 struct Pregnant(bool);
 
 #[derive(Component, Deref, DerefMut)]
-struct Velocity(Vec2);
+struct Direction(Vec2);
+
+#[derive(Component)]
+struct Speed(f32);
 
 #[derive(Component)]
 struct Collider;
@@ -70,11 +160,13 @@ struct Collider;
 enum CollisionEvent {
     Wall,
     Food,
-    Organism,
 }
 
 #[derive(Resource)]
 struct FoodTimer(Timer);
+
+#[derive(Resource)]
+struct LogTimer(Timer);
 
 #[derive(Resource)]
 struct SensoryTimer(Timer);
@@ -88,7 +180,7 @@ struct CollisionSound(Handle<AudioSource>);
 #[derive(Resource)]
 struct FeedingSound(Handle<AudioSource>);
 
-fn random_xy() -> Vec3 {
+fn random_position() -> Vec3 {
     let (x, y): (f32, f32) = (rand::random(), rand::random());
     Vec3::new(
         (x - 0.5) * 2.0 * RIGHT_BOUNDARY,
@@ -97,60 +189,149 @@ fn random_xy() -> Vec3 {
     )
 }
 
-fn random_velocity() -> Vec2 {
+fn random_direction() -> Vec2 {
     let (x, y): (f32, f32) = (rand::random(), rand::random());
-    Vec2::new(x - 0.5, y - 0.5) * 2.0 * ORGANISM_VELOCITY
+    let v = Vec2::new(x - 0.5, y - 0.5);
+    v / v.length()
 }
 
-fn rotate_velocity(velocity: &mut Vec2, angle: f32) {
+fn rotate_direction(direction: &mut Vec2, angle: f32) {
     let x = angle.cos();
     let y = angle.sin();
-    velocity.x = x * velocity.x + y * velocity.y;
-    velocity.y = -y * velocity.x + x * velocity.y;
+    direction.x = x * direction.x + y * direction.y;
+    direction.y = -y * direction.x + x * direction.y;
+    if direction.length() > 0.01 {
+        direction.x /= direction.length();
+        direction.y /= direction.length();
+    } else {
+        direction.x = 1.0 / (2.0_f32).sqrt();
+        direction.y = 1.0 / (2.0_f32).sqrt();
+    }
 }
 
-fn align_velocity(velocity: &mut Vec2, delta: &Vec2) {
-    // let angle = velocity.angle_between(*delta);
-    // if angle.abs() < 0.2 {
-    let r = delta.length();
-    velocity.x = (delta.x / r) * ORGANISM_VELOCITY;
-    velocity.y = (delta.y / r) * ORGANISM_VELOCITY;
-    // } else {
-    //     rotate_velocity(velocity, angle.clamp(-0.2, 0.2))
-    // }
+fn _align_direction(direction: &mut Vec2, delta: &Vec2) {
+    let angle = direction.angle_between(*delta);
+    if angle < 0.5 || angle > 5.7 {
+        let r = delta.length();
+        direction.x = delta.x / r;
+        direction.y = delta.y / r;
+    } else {
+        rotate_direction(direction, angle.clamp(-0.5, 0.5))
+    }
 }
 
-fn adjust_velocity(
+fn adjust_direction(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     time: Res<Time>,
     mut timer: ResMut<SensoryTimer>,
-    mut organism_query: Query<(&mut Velocity, &Transform, &Energy), With<Organism>>,
+    mut organism_query: Query<
+        (
+            &Transform,
+            &mut Direction,
+            &mut Speed,
+            &Energy,
+            &Lifetime,
+            &GeneInfo,
+        ),
+        With<Organism>,
+    >,
     food_query: Query<&Transform, With<Food>>,
 ) {
     if timer.0.tick(time.delta()).just_finished() {
-        for (mut velocity, transform, _energy) in &mut organism_query {
-            let organism_pos = transform.translation;
-            let mut nearest_food: Option<Vec2> = None;
-            let mut nearest_food_dist: f32 = f32::INFINITY;
+        for (transform, mut direction, mut speed, energy, lifetime, gene) in &mut organism_query {
+            let mut foods: [f32; 3] = [0.0, 0.0, 0.0];
             for food_transform in &food_query {
                 let food_pos = food_transform.translation;
-                let dir = (food_pos - organism_pos).truncate();
+                let dir = (food_pos - transform.translation).truncate();
                 let dist = dir.length();
-                if dist < ORGANISM_VISION && dist < nearest_food_dist {
-                    nearest_food_dist = dist;
-                    nearest_food = Some(dir);
+                if dist < ORGANISM_VISION {
+                    let alpha = dir.angle_between(**direction);
+                    let food_val = (ORGANISM_VISION * 0.5) / (ORGANISM_VISION + dist);
+                    if alpha > -0.1 && alpha < 0.1 {
+                        foods[1] += food_val;
+                    } else if alpha < 1.0 && alpha > 0.1 {
+                        foods[0] += food_val;
+                    } else if alpha > -1.0 && alpha < -0.1 {
+                        foods[2] += food_val;
+                    }
                 }
             }
-            if let Some(dir) = nearest_food {
-                align_velocity(&mut velocity, &dir);
+
+            let x_pos = transform.translation.x;
+            let y_pos = transform.translation.y;
+            let x_pos = (x_pos - LEFT_BOUNDARY) / (RIGHT_BOUNDARY - LEFT_BOUNDARY);
+            let y_pos = (y_pos - BOTTOM_BOUNDARY) / (TOP_BOUNDARY - BOTTOM_BOUNDARY);
+            if (x_pos < 0.1 && direction.x < 0.0)
+                || (x_pos > 0.9 && direction.x > 0.0)
+                || (y_pos < 0.1 && direction.y < 0.0)
+                || (y_pos > 0.9 && direction.y > 0.0)
+            {
+                foods[1] = -1.0;
             }
+            let inputs: [f32; 8] = [
+                speed.0 / ORGANISM_DEFAULT_SPEED,
+                x_pos,
+                y_pos,
+                (energy.0 - ORGANISM_MIN_ENERGY) / (ORGANISM_MAX_ENERGY - ORGANISM_MIN_ENERGY),
+                lifetime.0 as f32 / ORGANISM_DEFAULT_LIFETIME as f32,
+                foods[0].clamp(0.0, 1.0),
+                foods[1].clamp(0.0, 1.0),
+                foods[2].clamp(0.0, 1.0),
+            ];
+            let output = gene.process(&inputs);
+            rotate_direction(&mut direction, output[0]);
+            speed.0 = (speed.0 + output[1]).clamp(0.0, ORGANISM_DEFAULT_SPEED);
+
+            commands.spawn((
+                MaterialMesh2dBundle {
+                    mesh: meshes.add(shape::Circle::default().into()).into(),
+                    material: materials.add(ColorMaterial::from(gene.color())),
+                    transform: Transform::from_translation(transform.translation)
+                        .with_scale(PHEROMONE_SIZE),
+                    ..default()
+                },
+                Pheromone,
+                Lifetime(PHEROMONE_DEFAULT_LIFETIME),
+                Age(1),
+            ));
         }
     }
 }
 
-fn apply_velocity(mut query: Query<(&mut Transform, &Velocity, &Energy)>) {
-    for (mut transform, velocity, energy) in &mut query {
-        transform.translation.x += velocity.x * TIME_STEP / energy.0;
-        transform.translation.y += velocity.y * TIME_STEP / energy.0;
+fn pheromone_fade(
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    query: Query<(&Handle<ColorMaterial>, &Age, &Lifetime), With<Pheromone>>,
+) {
+    for (handle, age, lifetime) in &query {
+        let mut col = materials.get_mut(handle).unwrap().color;
+        col.set_a(1.0 - age.0 as f32 / lifetime.0 as f32);
+    }
+}
+
+fn apply_direction(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Transform, &Direction, &Speed, &mut Energy)>,
+) {
+    for (entity, mut transform, direction, speed, mut energy) in &mut query {
+        if transform.translation.x < LEFT_BOUNDARY
+            || transform.translation.x > RIGHT_BOUNDARY
+            || transform.translation.y < BOTTOM_BOUNDARY
+            || transform.translation.y > TOP_BOUNDARY
+        {
+            commands.entity(entity).despawn();
+        }
+        let deltax = direction.x * speed.0 * TIME_STEP * SIMULATION_SPEED;
+        let deltay = direction.y * speed.0 * TIME_STEP * SIMULATION_SPEED;
+
+        transform.translation.x += deltax;
+        transform.translation.y += deltay;
+
+        // propotional energy consumption based on size
+        energy.0 *= 0.999;
+        // energy comsumption based on speed
+        energy.0 -= speed.0.powi(2) / 50000000.0;
     }
 }
 
@@ -162,11 +343,32 @@ fn age_progression(
 ) {
     if timer.0.tick(time.delta()).just_finished() {
         for (entity, mut age, lifetime) in &mut query {
-            if age.0 > lifetime.0 {
+            if age.0 > lifetime.0 as usize {
                 commands.entity(entity).despawn();
             } else {
                 age.0 += 1;
             }
+        }
+    }
+}
+
+fn log_things(
+    time: Res<Time>,
+    mut timer: ResMut<LogTimer>,
+    query: Query<(&GeneInfo, &Direction, &Speed), With<Organism>>,
+) {
+    if timer.0.tick(time.delta()).just_finished() {
+        let file = std::fs::File::create("organisms.txt").unwrap();
+        let mut file = std::io::BufWriter::new(file);
+        for (gene, direction, speed) in &query {
+            file.write(
+                format!(
+                    "{},{} ({}) <- {:?}\n",
+                    direction.x, direction.y, speed.0, gene.0,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         }
     }
 }
@@ -192,19 +394,22 @@ fn startup(
 
     // Organism
     for _ in 0..INITIAL_POPULATION {
+        let gene = GeneInfo::planned();
         commands.spawn((
             MaterialMesh2dBundle {
                 mesh: meshes.add(shape::Circle::default().into()).into(),
-                material: materials.add(ColorMaterial::from(ORGANISM_COLOR)),
-                transform: Transform::from_translation(random_xy()).with_scale(ORGANISM_SIZE),
+                material: materials.add(ColorMaterial::from(gene.color())),
+                transform: Transform::from_translation(random_position()).with_scale(ORGANISM_SIZE),
                 ..default()
             },
             Organism,
+            gene,
+            Lifetime(ORGANISM_DEFAULT_LIFETIME),
+            Speed(ORGANISM_DEFAULT_SPEED),
             Energy(1.0),
             Age(1),
-            Lifetime(ORGANISM_LIFETIME),
             Pregnant(false),
-            Velocity(random_velocity()),
+            Direction(random_direction()),
         ));
     }
 }
@@ -213,21 +418,16 @@ fn generate_food(
     time: Res<Time>,
     mut timer: ResMut<FoodTimer>,
     mut commands: Commands,
-    mut organism_query: Query<&mut Energy, With<Organism>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
     if timer.0.tick(time.delta()).just_finished() {
-        for mut organism_energy in &mut organism_query {
-            organism_energy.0 -= 0.02;
-        }
-
-        for _ in 0..4 {
+        for _ in 0..FOOD_PER_TIMESTEP {
             commands.spawn((
                 MaterialMesh2dBundle {
                     mesh: meshes.add(shape::Circle::default().into()).into(),
                     material: materials.add(ColorMaterial::from(FOOD_COLOR)),
-                    transform: Transform::from_translation(random_xy()).with_scale(FOOD_SIZE),
+                    transform: Transform::from_translation(random_position()).with_scale(FOOD_SIZE),
                     ..default()
                 },
                 Food,
@@ -318,7 +518,7 @@ fn grow_organism(
         (
             Entity,
             &mut Transform,
-            &Handle<ColorMaterial>,
+            &GeneInfo,
             &mut Energy,
             &mut Pregnant,
         ),
@@ -327,51 +527,55 @@ fn grow_organism(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    for (organism, mut organism_transform, handle, mut organism_energy, mut organism_pregnant) in
+    for (organism, mut organism_transform, gene_info, mut organism_energy, mut organism_pregnant) in
         &mut organism_query
     {
-        if organism_energy.0 < 0.3 || organism_energy.0 > 3.0 {
+        if organism_energy.0 < ORGANISM_MIN_ENERGY || organism_energy.0 > ORGANISM_MAX_ENERGY {
             commands.entity(organism).despawn();
         } else if organism_pregnant.0 {
             organism_energy.0 = 1.0;
             organism_pregnant.0 = false;
-            materials.get_mut(handle).unwrap().color = ORGANISM_COLOR;
-
-            commands.spawn((
-                MaterialMesh2dBundle {
-                    mesh: meshes.add(shape::Circle::default().into()).into(),
-                    material: materials.add(ColorMaterial::from(ORGANISM_COLOR)),
-                    transform: Transform::from_translation(organism_transform.translation)
-                        .with_scale(ORGANISM_SIZE),
-                    ..default()
-                },
-                Organism,
-                Energy(0.5),
-                Age(1),
-                Lifetime(ORGANISM_LIFETIME),
-                Pregnant(false),
-                Velocity(random_velocity()),
-            ));
-        } else if organism_energy.0 > 2.5 {
-            materials.get_mut(handle).unwrap().color = OLD_ORGANISM_COLOR;
-        } else if organism_energy.0 > 2.0 {
-            materials.get_mut(handle).unwrap().color = FERTILE_ORGANISM_COLOR;
+            for _ in 0..CHILDREN_PER_PREGNANCY {
+                let gene = gene_info.mutate();
+                commands.spawn((
+                    MaterialMesh2dBundle {
+                        mesh: meshes.add(shape::Circle::default().into()).into(),
+                        material: materials.add(ColorMaterial::from(gene.color())),
+                        transform: Transform::from_translation(organism_transform.translation)
+                            .with_scale(ORGANISM_SIZE),
+                        ..default()
+                    },
+                    Organism,
+                    Energy(0.5),
+                    Age(1),
+                    gene,
+                    Lifetime(ORGANISM_DEFAULT_LIFETIME),
+                    Speed(ORGANISM_DEFAULT_SPEED),
+                    Pregnant(false),
+                    Direction(random_direction()),
+                ));
+            }
         }
-        organism_transform.scale = ORGANISM_SIZE * organism_energy.0;
+        organism_transform.scale = ORGANISM_SIZE * organism_energy.0.sqrt();
     }
 }
 
 fn check_for_collisions(
     mut commands: Commands,
     mut organism_query: Query<
-        (&mut Velocity, &Transform, &mut Energy, &mut Pregnant),
+        (&mut Direction, &Transform, &Age, &mut Energy, &mut Pregnant),
         With<Organism>,
     >,
     collider_query: Query<(Entity, &Transform, Option<&Food>), With<Collider>>,
     mut collision_events: EventWriter<CollisionEvent>,
 ) {
-    for (mut organism_velocity, organism_transform, mut organism_energy, mut organism_pregnant) in
-        &mut organism_query
+    for (
+        mut organism_direction,
+        organism_transform,
+        organism_age,
+        mut organism_energy,
+        mut organism_pregnant,
+    ) in &mut organism_query
     {
         let organism_size = organism_transform.scale.truncate();
 
@@ -387,8 +591,8 @@ fn check_for_collisions(
                     commands.entity(collider_entity).despawn();
                     collision_events.send(CollisionEvent::Food);
                     organism_energy.0 += 0.2;
-                    if organism_energy.0 > 1.7
-                        && organism_energy.0 < 2.5
+                    if organism_energy.0 > PREGNANCY_ENERGY_MINIMUM
+                        && organism_age.0 > FERTILE_AGE
                         && rand::random::<f32>() < PREGNANT_PROBABILITY
                     {
                         organism_pregnant.0 = true;
@@ -399,24 +603,24 @@ fn check_for_collisions(
                     let mut reflect_x = false;
                     let mut reflect_y = false;
 
-                    // only reflect if the organism's velocity is going in the opposite direction of the
+                    // only reflect if the organism's direction is going in the opposite direction of the
                     // collision
                     match collision {
-                        Collision::Left => reflect_x = organism_velocity.x > 0.0,
-                        Collision::Right => reflect_x = organism_velocity.x < 0.0,
-                        Collision::Top => reflect_y = organism_velocity.y < 0.0,
-                        Collision::Bottom => reflect_y = organism_velocity.y > 0.0,
+                        Collision::Left => reflect_x = organism_direction.x > 0.0,
+                        Collision::Right => reflect_x = organism_direction.x < 0.0,
+                        Collision::Top => reflect_y = organism_direction.y < 0.0,
+                        Collision::Bottom => reflect_y = organism_direction.y > 0.0,
                         Collision::Inside => { /* do nothing */ }
                     }
 
-                    // reflect velocity on the x-axis if we hit something on the x-axis
+                    // reflect direction on the x-axis if we hit something on the x-axis
                     if reflect_x {
-                        organism_velocity.x = -organism_velocity.x;
+                        organism_direction.x = -organism_direction.x;
                     }
 
-                    // reflect velocity on the y-axis if we hit something on the y-axis
+                    // reflect direction on the y-axis if we hit something on the y-axis
                     if reflect_y {
-                        organism_velocity.y = -organism_velocity.y;
+                        organism_direction.y = -organism_direction.y;
                     }
                 }
             }
@@ -424,7 +628,7 @@ fn check_for_collisions(
     }
 }
 
-fn play_collision_sound(
+fn _play_collision_sound(
     mut collision_events: EventReader<CollisionEvent>,
     audio: Res<Audio>,
     collision: Res<CollisionSound>,
@@ -450,23 +654,38 @@ pub struct HelloPlugin;
 
 impl Plugin for HelloPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(FoodTimer(Timer::from_seconds(0.2, TimerMode::Repeating)))
-            .insert_resource(SensoryTimer(Timer::from_seconds(0.4, TimerMode::Repeating)))
-            .insert_resource(AgeTimer(Timer::from_seconds(1.0, TimerMode::Repeating)))
-            .add_startup_system(startup)
-            .add_event::<CollisionEvent>()
-            .add_systems(
-                (
-                    generate_food,
-                    age_progression,
-                    check_for_collisions,
-                    apply_velocity.before(check_for_collisions),
-                    grow_organism.after(check_for_collisions),
-                    // play_collision_sound.after(check_for_collisions),
-                    adjust_velocity,
-                )
-                    .in_schedule(CoreSchedule::FixedUpdate),
+        app.insert_resource(FoodTimer(Timer::from_seconds(
+            0.2 / SIMULATION_SPEED,
+            TimerMode::Repeating,
+        )))
+        .insert_resource(SensoryTimer(Timer::from_seconds(
+            0.5 / SIMULATION_SPEED,
+            TimerMode::Repeating,
+        )))
+        .insert_resource(AgeTimer(Timer::from_seconds(
+            1.0 / SIMULATION_SPEED,
+            TimerMode::Repeating,
+        )))
+        .insert_resource(LogTimer(Timer::from_seconds(
+            10.0 / SIMULATION_SPEED,
+            TimerMode::Repeating,
+        )))
+        .add_startup_system(startup)
+        .add_event::<CollisionEvent>()
+        .add_systems(
+            (
+                pheromone_fade,
+                log_things,
+                generate_food,
+                age_progression,
+                check_for_collisions,
+                apply_direction.before(adjust_direction),
+                grow_organism.after(check_for_collisions),
+                // play_collision_sound.after(check_for_collisions),
+                adjust_direction.after(check_for_collisions),
             )
-            .insert_resource(FixedTime::new_from_secs(TIME_STEP));
+                .in_schedule(CoreSchedule::FixedUpdate),
+        )
+        .insert_resource(FixedTime::new_from_secs(TIME_STEP));
     }
 }
